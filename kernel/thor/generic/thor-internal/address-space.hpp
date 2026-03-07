@@ -185,6 +185,28 @@ frg::expected<Error, PagesAffected> unmapPagesByCursor(PageSpace *ps, VirtualAdd
 	return affected;
 }
 
+template<typename Cursor, typename PageSpace>
+frg::expected<Error, PagesAffected> agePagesByCursor(PageSpace *ps, VirtualAddr va, size_t size) {
+	assert(!(va & (kPageSize - 1)));
+	assert(!(size & (kPageSize - 1)));
+
+	PagesAffected affected{};
+	Cursor c{ps, va};
+	while(c.findPresent(va + size)) {
+		auto [status, physical, unmapped] = c.age4k();
+		if(unmapped) {
+			if(status & page_status::dirty) {
+				if(auto descriptor = globalPfnDb().find(physical))
+					markDirty(*descriptor);
+			}
+			affected.rss -= kPageSize;
+			affected.anyRevoked = true;
+		}
+		c.advance4k();
+	}
+	return affected;
+}
+
 struct VirtualOperations {
 	virtual void retire(RetireNode *node) = 0;
 
@@ -202,6 +224,8 @@ struct VirtualOperations {
 	virtual frg::expected<Error, PagesAffected> cleanPages(VirtualAddr va, size_t size) = 0;
 
 	virtual frg::expected<Error, PagesAffected> unmapPages(VirtualAddr va, size_t size) = 0;
+
+	virtual frg::expected<Error, PagesAffected> agePages(VirtualAddr va, size_t size) = 0;
 
 	// ----------------------------------------------------------------------------------
 	// Sender boilerplate for retire()
@@ -525,6 +549,8 @@ public:
 	coroutine<frg::expected<Error, PhysicalAddr>>
 	retrievePhysical(VirtualAddr address);
 
+	coroutine<void> runAgingLoop();
+
 	size_t rss() {
 		auto value = rss_.load(std::memory_order_relaxed);
 		return (value > 0) ? value : 0;
@@ -665,6 +691,9 @@ private:
 	MappingTree _mappings;
 
 	std::atomic<ptrdiff_t> rss_;
+
+	async::cancellation_event cancelAging_;
+	async::oneshot_event agingDoneEvent_;
 };
 
 struct AddressSpace final : VirtualSpace, smarter::crtp_counter<AddressSpace, BindableHandle> {
@@ -713,6 +742,11 @@ struct AddressSpace final : VirtualSpace, smarter::crtp_counter<AddressSpace, Bi
 					va, size);
 		}
 
+		frg::expected<Error, PagesAffected> agePages(VirtualAddr va, size_t size) override {
+			return agePagesByCursor<ClientPageSpace::Cursor>(&space_->pageSpace_,
+					va, size);
+		}
+
 	private:
 		AddressSpace *space_;
 	};
@@ -730,6 +764,7 @@ public:
 		auto ptr = smarter::allocate_shared<AddressSpace>(Allocator{});
 		ptr->selfPtr = ptr;
 		ptr->setupInitialHole(0x1000, (UINT64_C(1) << getLowerHalfBits()) - 0x1000);
+		spawnOnWorkQueue(*kernelAlloc, WorkQueue::generalQueue().lock(), ptr->runAgingLoop());
 		return constructHandle(std::move(ptr));
 	}
 
