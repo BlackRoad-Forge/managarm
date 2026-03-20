@@ -13,6 +13,7 @@ namespace thor {
 
 namespace {
 	constexpr bool logUsage = false;
+	constexpr bool logReclaim = false;
 	constexpr bool logUncaching = false;
 
 	// The following flags are debugging options to debug the correctness of various components.
@@ -25,162 +26,251 @@ namespace {
 // --------------------------------------------------------
 
 struct MemoryReclaimer {
-	void addPage(CachePage *page) {
+	void registerBundle(CacheBundle *bundle) {
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&mutex_);
 
-		assert(!(page->flags & CachePage::reclaimRegistered));
+		bundleList_.push_back(bundle);
+	}
 
-		_lruList.push_back(page);
-		page->flags |= CachePage::reclaimRegistered;
-		_cachedSize += kPageSize;
+	void addPage(CachePage *page) {
+		auto *bundle = page->bundle;
+		{
+			auto irqLock = frg::guard(&irqMutex());
+			auto lock = frg::guard(&bundle->reclaimMutex_);
+
+			assert(!(page->flags & CachePage::reclaimRegistered));
+
+			page->generation = bundle->newestGen_;
+			bundle->genLists_[bundle->newestGen_].push_back(page);
+			page->flags |= CachePage::reclaimRegistered;
+		}
+
+		rotationTurnaround_.fetch_add(1, std::memory_order_relaxed);
+		if (shouldRotate_())
+			rotationEvent_.raise();
 	}
 
 	void removePage(CachePage *page) {
+		auto *bundle = page->bundle;
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&bundle->reclaimMutex_);
 
 		assert(page->flags & CachePage::reclaimRegistered);
 
 		if(page->flags & CachePage::reclaimPosted) {
 			if(!(page->flags & CachePage::reclaimInflight)) {
-				auto it = page->bundle->_reclaimList.iterator_to(page);
-				page->bundle->_reclaimList.erase(it);
+				auto it = bundle->_reclaimList.iterator_to(page);
+				bundle->_reclaimList.erase(it);
 			}
 
 			page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
 		}else{
-			auto it = _lruList.iterator_to(page);
-			_lruList.erase(it);
-			_cachedSize -= kPageSize;
+			auto it = bundle->genLists_[page->generation].iterator_to(page);
+			bundle->genLists_[page->generation].erase(it);
 		}
 		page->flags &= ~CachePage::reclaimRegistered;
 	}
 
 	void bumpPage(CachePage *page) {
-		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto *bundle = page->bundle;
+		{
+			auto irqLock = frg::guard(&irqMutex());
+			auto lock = frg::guard(&bundle->reclaimMutex_);
 
-		assert(page->flags & CachePage::reclaimRegistered);
+			assert(page->flags & CachePage::reclaimRegistered);
 
-		if(page->flags & CachePage::reclaimPosted) {
-			if(!(page->flags & CachePage::reclaimInflight)) {
-				auto it = page->bundle->_reclaimList.iterator_to(page);
-				page->bundle->_reclaimList.erase(it);
+			if(page->flags & CachePage::reclaimPosted) {
+				if(!(page->flags & CachePage::reclaimInflight)) {
+					auto it = bundle->_reclaimList.iterator_to(page);
+					bundle->_reclaimList.erase(it);
+				}
+
+				page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
+				page->generation = bundle->newestGen_;
+				bundle->genLists_[bundle->newestGen_].push_back(page);
+			}else if(page->generation != bundle->newestGen_) {
+				auto it = bundle->genLists_[page->generation].iterator_to(page);
+				bundle->genLists_[page->generation].erase(it);
+				page->generation = bundle->newestGen_;
+				bundle->genLists_[bundle->newestGen_].push_back(page);
 			}
-
-			page->flags &= ~(CachePage::reclaimPosted | CachePage::reclaimInflight);
-			_cachedSize += kPageSize;
-		}else{
-			auto it = _lruList.iterator_to(page);
-			_lruList.erase(it);
 		}
 
-		_lruList.push_back(page);
+		rotationTurnaround_.fetch_add(1, std::memory_order_relaxed);
+		if (shouldRotate_())
+			rotationEvent_.raise();
 	}
 
 	auto awaitReclaim(CacheBundle *bundle, async::cancellation_token ct = {}) {
 		return async::transform(
-			bundle->_reclaimEvent.async_wait(ct),
+			bundle->_reclaimEvent.async_wait_if(
+				[bundle] {
+					auto irqLock = frg::guard(&irqMutex());
+					auto lock = frg::guard(&bundle->reclaimMutex_);
+					return bundle->_reclaimList.empty();
+				},
+				ct),
 			[] (auto) { }
 		);
 	}
 
-	CachePage *reclaimPage(CacheBundle *bundle) {
+	void reclaimPages(CacheBundle *bundle, CachePagesList &out) {
 		auto irqLock = frg::guard(&irqMutex());
-		auto lock = frg::guard(&_mutex);
+		auto lock = frg::guard(&bundle->reclaimMutex_);
 
-		if(bundle->_reclaimList.empty())
-			return nullptr;
+		out.splice(out.end(), bundle->_reclaimList);
 
-		auto page = bundle->_reclaimList.pop_front();
+		for(auto page : out) {
+			assert(page->flags & CachePage::reclaimRegistered);
+			assert(page->flags & CachePage::reclaimPosted);
+			assert(!(page->flags & CachePage::reclaimInflight));
 
-		assert(page->flags & CachePage::reclaimRegistered);
-		assert(page->flags & CachePage::reclaimPosted);
-		assert(!(page->flags & CachePage::reclaimInflight));
-
-		page->flags |= CachePage::reclaimInflight;
-
-		return page;
+			page->flags |= CachePage::reclaimInflight;
+		}
 	}
 
 	void runReclaimFiber() {
-		auto checkReclaim = [this] () -> bool {
-			if(disableUncaching)
-				return false;
-
-			auto irqLock = frg::guard(&irqMutex());
-			auto lock = frg::guard(&_mutex);
-
-			if(_lruList.empty())
-				return false;
-
-			if(!tortureUncaching) {
-				auto pagesWatermark = physicalAllocator->numTotalPages() * 3 / 4;
-				auto usedPages = physicalAllocator->numUsedPages();
-				if(usedPages < pagesWatermark) {
-					return false;
-				}else{
-					if(logUncaching)
-						infoLogger() << "thor: Uncaching page. " << usedPages
-								<< " pages are in use (watermark: " << pagesWatermark << ")"
-								<< frg::endlog;
-				}
-			}
-
-			auto page = _lruList.pop_front();
-
-			assert(page->flags & CachePage::reclaimRegistered);
-			assert(!(page->flags & CachePage::reclaimPosted));
-			assert(!(page->flags & CachePage::reclaimInflight));
-
-			page->flags |= CachePage::reclaimPosted;
-			_cachedSize -= kPageSize;
-
-			page->bundle->_reclaimList.push_back(page);
-			page->bundle->_reclaimEvent.raise();
-
-			return true;
-		};
-
-		KernelFiber::run([=, this] {
+		KernelFiber::run([this] {
+			if (disableUncaching)
+				return;
 			while(true) {
-				if(logUncaching) {
-					auto irqLock = frg::guard(&irqMutex());
-					auto lock = frg::guard(&_mutex);
-					auto totalPages = physicalAllocator->numTotalPages();
-					auto usedPages = physicalAllocator->numUsedPages();
+				auto totalPages = physicalAllocator->numTotalPages();
+				auto usedPages = physicalAllocator->numUsedPages();
+
+				if(logReclaim) {
 					infoLogger() << "thor: " << (usedPages * kPageSize / 1024)
 							<< " KiB / " << (totalPages * kPageSize / 1024)
-							<< " in use" << frg::endlog;
-					infoLogger() << "thor: " << (_cachedSize / 1024)
-							<< " KiB of cached pages" << frg::endlog;
+							<< " KiB in use" << frg::endlog;
 				}
 
-				while(checkReclaim())
-					;
-				if(tortureUncaching) {
-					KernelFiber::asyncBlockCurrent(generalTimerEngine()->sleepFor(10'000'000));
-				}else{
-					KernelFiber::asyncBlockCurrent(generalTimerEngine()->sleepFor(1'000'000'000));
+				// On memory pressure: rotate generations until pressure drops.
+				if (checkPressure_()) {
+					for(unsigned int i = 1; i <= CacheBundle::numGenerations; i++) {
+						if(!checkPressure_())
+							break;
+
+						auto result = rotateGenerations_();
+						if(logReclaim) {
+							infoLogger() << frg::fmt(
+								"thor: Reclamation under pressure (iteration {}) reclaims 0x{:x} bytes",
+								i,
+								result.sizeReclaimed
+							) << frg::endlog;
+						}
+					}
 				}
+
+				// Otherwise: rotate generations when number of page bumps crosses threshold.
+				if(shouldRotate_()) {
+					auto result = rotateGenerations_();
+					if(logReclaim) {
+						infoLogger() << frg::fmt(
+							"thor: Generation rotation reclaims 0x{:x} bytes",
+							result.sizeReclaimed
+						) << frg::endlog;
+					}
+				}
+
+				auto sleepNs = tortureUncaching ? 10'000'000 : 1'000'000'000;
+				KernelFiber::asyncBlockCurrent(
+					async::race_and_cancel(
+						[&] (async::cancellation_token ct) {
+							return async::transform(
+								rotationEvent_.async_wait_if([&] -> bool {
+									return !shouldRotate_();
+								}, ct),
+								[] (auto) {}
+							);
+						},
+						[&] (async::cancellation_token ct) {
+							// TODO: It would be nicer to also handle the pressure case by an event
+							//       but that requires integration with the physical allocator.
+							return async::transform(
+								generalTimerEngine()->sleepFor(sleepNs, ct),
+								[] (auto) {}
+							);
+						}
+					)
+				);
 			}
 		});
 	}
 
 private:
-	frg::ticket_spinlock _mutex;
+	struct RotateResult {
+		size_t sizeReclaimed{0};
+	};
 
-	frg::intrusive_list<
-		CachePage,
+	RotateResult rotateGenerations_() {
+		rotationTurnaround_.store(0, std::memory_order_relaxed);
+
+		size_t sizeReclaimed = 0;
+		for(auto it = bundleList_.begin(); it != bundleList_.end(); ++it) {
+			auto *bundle = *it;
+
+			bool anyReclaimed = false;
+			{
+				auto irqLock = frg::guard(&irqMutex());
+				auto lock = frg::guard(&bundle->reclaimMutex_);
+
+				// The slot after newest is the oldest.
+				// This becomes the newest generation after rotation.
+				auto g = (bundle->newestGen_ + 1) % CacheBundle::numGenerations;
+
+				// Drain the oldest generation into _reclaimList.
+				auto &genList = bundle->genLists_[g];
+				while(!genList.empty()) {
+					auto page = genList.pop_front();
+					assert(page->flags & CachePage::reclaimRegistered);
+					assert(!(page->flags & CachePage::reclaimPosted));
+					page->flags |= CachePage::reclaimPosted;
+					bundle->_reclaimList.push_back(page);
+					anyReclaimed = true;
+					sizeReclaimed += kPageSize;
+				}
+				bundle->newestGen_ = g;
+			}
+
+			if(anyReclaimed)
+				bundle->_reclaimEvent.raise();
+		}
+
+		return {
+			.sizeReclaimed = sizeReclaimed
+		};
+	}
+
+	bool shouldRotate_() {
+		// TODO: We assume that half of total memory is available for CachePages.
+		//       Instead, we should track how many non-swappable pages are allocated
+		//       and subtract that from the total page count.
+		auto totalCachePages = physicalAllocator->numTotalPages() / 2;
+		auto threshold = totalCachePages / CacheBundle::numGenerations;
+		return rotationTurnaround_.load(std::memory_order_relaxed) >= threshold;
+	}
+
+	bool checkPressure_() {
+		auto watermark = physicalAllocator->numTotalPages() * 3 / 4;
+		return tortureUncaching || physicalAllocator->numUsedPages() >= watermark;
+	}
+
+	frg::ticket_spinlock mutex_;
+
+	// Protected against modification by mutex_.
+	frg::intrusive_rcu_list<
+		CacheBundle,
 		frg::locate_member<
-			CachePage,
-			frg::default_list_hook<CachePage>,
-			&CachePage::listHook
+			CacheBundle,
+			frg::intrusive_rcu_list_hook<CacheBundle>,
+			&CacheBundle::reclaimerHook_
 		>
-	> _lruList;
+	> bundleList_;
 
-	size_t _cachedSize = 0;
+	// Number of pages bumped since the last generation rotation.
+	std::atomic<size_t> rotationTurnaround_{0};
+
+	async::recurring_event rotationEvent_;
 };
 
 static frg::manual_box<MemoryReclaimer> globalReclaimer;
@@ -756,62 +846,94 @@ ManagedSpace::ManagedSpace(size_t length, bool readahead)
 : pages{*kernelAlloc}, numPages{length >> kPageShift}, readahead{readahead} {
 	assert(!(length & (kPageSize - 1)));
 
+	globalReclaimer->registerBundle(this);
+
 	[] (ManagedSpace *self, enable_detached_coroutine) -> void {
 		while(true) {
 			// TODO: Cancel awaitReclaim() when the ManagedSpace is destructed.
 			co_await globalReclaimer->awaitReclaim(self);
 
-			CachePage *page;
-			ManagedPage *pit;
+			CachePagesList batch;
 			{
 				auto irqLock = frg::guard(&irqMutex());
 				auto lock = frg::guard(&self->mutex);
 
-				page = globalReclaimer->reclaimPage(self);
-				if(!page)
-					continue;
+				globalReclaimer->reclaimPages(self, batch);
 
-				size_t index = page->identity;
-				pit = self->pages.find(index);
-				assert(pit);
-				assert(pit->loadState == LoadState::present);
-				assert(pit->transactionState == TxState::inReclaim);
-				assert(!pit->lockCount);
-				pit->loadState = LoadState::evicting;
-				pit->transactionState = TxState::none;
-				globalReclaimer->removePage(&pit->cachePage);
-			}
-
-			co_await self->_evictQueue.fenceEphemeral();
-
-			PhysicalAddr physical;
-			frg::intrusive_shared_ptr<ManagedSpace::TransactionMonitor, Allocator> invalidateMonitor;
-			{
-				auto irqLock = frg::guard(&irqMutex());
-				auto lock = frg::guard(&self->mutex);
-
-				if(pit->loadState != LoadState::evicting)
-					continue;
-				assert(!pit->lockCount);
-				assert(pit->physical != PhysicalAddr(-1));
-				physical = pit->physical;
-
-				pit->loadState = LoadState::missing;
-				pit->transactionState = TxState::none;
-				pit->physical = PhysicalAddr(-1);
-
-				if(pit->forceInvalidation) {
-					invalidateMonitor = std::move(pit->monitor);
-					pit->forceInvalidation = false;
+				for(auto cachePage : batch) {
+					auto *page = frg::container_of(cachePage, &ManagedPage::cachePage);
+					assert(page);
+					assert(page->loadState == LoadState::present);
+					assert(page->transactionState == TxState::inReclaimer);
+					assert(!page->lockCount);
+					page->transactionState = TxState::performReclaim;
+					globalReclaimer->removePage(cachePage);
 				}
 			}
 
+			if(batch.empty())
+				continue;
+
+			co_await self->_evictQueue.fenceEphemeral();
+
+			bool anyDirty = false;
+			size_t sizeFreed = 0;
+			while(!batch.empty()) {
+				PhysicalAddr physical;
+				frg::intrusive_shared_ptr<TransactionMonitor, Allocator> invalidateMonitor;
+				{
+					auto irqLock = frg::guard(&irqMutex());
+					auto lock = frg::guard(&self->mutex);
+
+					auto cachePage = batch.pop_front();
+					auto *page = frg::container_of(cachePage, &ManagedPage::cachePage);
+
+					if(page->transactionState == TxState::avertReclaim) {
+						if(page->stillDirty) {
+							page->stillDirty = false;
+							page->transactionState = TxState::dirty;
+							self->_dirtyList.push_back(&page->cachePage);
+							anyDirty = true;
+						} else if(page->lockCount
+								|| page->cachePage.useCount.load(std::memory_order_relaxed)) {
+							page->transactionState = TxState::none;
+						} else {
+							globalReclaimer->addPage(&page->cachePage);
+							page->transactionState = TxState::inReclaimer;
+						}
+						continue;
+					}
+					assert(page->transactionState == TxState::performReclaim);
+
+					assert(!page->lockCount);
+					assert(page->physical != PhysicalAddr(-1));
+					physical = page->physical;
+
+					page->loadState = LoadState::missing;
+					page->transactionState = TxState::none;
+					page->physical = PhysicalAddr(-1);
+
+					if(page->forceInvalidation) {
+						invalidateMonitor = std::move(page->monitor);
+						page->forceInvalidation = false;
+					}
+				}
+
+				globalPfnDb().erase(physical);
+				physicalAllocator->free(physical, kPageSize);
+				if(invalidateMonitor)
+					invalidateMonitor->event.raise();
+				sizeFreed += kPageSize;
+			}
+
+			if(anyDirty)
+				self->_dirtyEvent.raise();
+
 			if(logUncaching)
-				warningLogger() << "Evicting physical page" << frg::endlog;
-			globalPfnDb().erase(physical);
-			physicalAllocator->free(physical, kPageSize);
-			if(invalidateMonitor)
-				invalidateMonitor->event.raise();
+				infoLogger() << frg::fmt(
+					"thor: Reclamation freed 0x{:x} bytes",
+					sizeFreed
+				)<< frg::endlog;
 		}
 	}(this, enable_detached_coroutine{WorkQueue::generalQueue().lock()});
 
@@ -881,16 +1003,13 @@ Error ManagedSpace::lockPages(uintptr_t offset, size_t size) {
 		assert(pit);
 		pit->lockCount++;
 		if(pit->lockCount == 1) {
-			if(pit->loadState == LoadState::present && pit->transactionState == TxState::inReclaim) {
+			if(pit->loadState == LoadState::present && pit->transactionState == TxState::inReclaimer) {
 				globalReclaimer->removePage(&pit->cachePage);
 				pit->transactionState = TxState::none;
-			}else if(pit->loadState == LoadState::evicting) {
-				assert(pit->transactionState == TxState::none);
-				// Stop the eviction to keep the page present.
-				pit->loadState = LoadState::present;
+			}else if(pit->transactionState == TxState::performReclaim) {
+				pit->transactionState = TxState::avertReclaim;
 			}
 		}
-		assert(pit->loadState != LoadState::evicting);
 	}
 	return Error::success;
 }
@@ -911,10 +1030,9 @@ void ManagedSpace::unlockPages(uintptr_t offset, size_t size) {
 			if(pit->loadState == LoadState::present && pit->transactionState == TxState::none
 					&& !pit->cachePage.useCount.load(std::memory_order_relaxed)) {
 				globalReclaimer->addPage(&pit->cachePage);
-				pit->transactionState = TxState::inReclaim;
+				pit->transactionState = TxState::inReclaimer;
 			}
 		}
-		assert(pit->loadState != LoadState::evicting);
 	}
 }
 
@@ -1000,11 +1118,11 @@ void ManagedSpace::incrementUses(CachePage *cachePage) {
 	auto cnt = cachePage->useCount.fetch_add(1, std::memory_order_acquire);
 	if(!cnt) {
 		if(page->loadState == LoadState::present
-				&& page->transactionState == TxState::inReclaim) {
+				&& page->transactionState == TxState::inReclaimer) {
 			globalReclaimer->removePage(cachePage);
 			page->transactionState = TxState::none;
-		} else if(page->loadState == LoadState::evicting) {
-			page->loadState = LoadState::present;
+		} else if(page->transactionState == TxState::performReclaim) {
+			page->transactionState = TxState::avertReclaim;
 		}
 	}
 }
@@ -1022,7 +1140,7 @@ void ManagedSpace::decrementUses(CachePage *cachePage) {
 				&& page->transactionState == TxState::none
 				&& !page->lockCount) {
 			globalReclaimer->addPage(cachePage);
-			page->transactionState = TxState::inReclaim;
+			page->transactionState = TxState::inReclaimer;
 		}
 	}
 }
@@ -1040,17 +1158,16 @@ void ManagedSpace::markDirty(CachePage *cachePage) {
 
 		if(page->loadState == LoadState::present
 				&& (page->transactionState == TxState::none
-					|| page->transactionState == TxState::inReclaim)) {
-			if(page->transactionState == TxState::inReclaim)
+					|| page->transactionState == TxState::inReclaimer)) {
+			if(page->transactionState == TxState::inReclaimer)
 				globalReclaimer->removePage(cachePage);
 			page->transactionState = TxState::dirty;
 			_dirtyList.push_back(cachePage);
 			needsEvent = true;
-		} else if(page->loadState == LoadState::evicting) {
-			page->loadState = LoadState::present;
-			page->transactionState = TxState::dirty;
-			_dirtyList.push_back(cachePage);
-			needsEvent = true;
+		} else if(page->transactionState == TxState::performReclaim
+				|| page->transactionState == TxState::avertReclaim) {
+			page->transactionState = TxState::avertReclaim;
+			page->stillDirty = true;
 		} else if(page->transactionState == TxState::writeback) {
 			page->stillDirty = true;
 		} else {
@@ -1204,7 +1321,7 @@ Error BackingMemory::updateRange(ManageRequest type, size_t offset, size_t lengt
 					pit->transactionState = ManagedSpace::TxState::none;
 				} else {
 					globalReclaimer->addPage(&pit->cachePage);
-					pit->transactionState = ManagedSpace::TxState::inReclaim;
+					pit->transactionState = ManagedSpace::TxState::inReclaimer;
 				}
 				ref_rc(pit->monitor.get());
 				pendingMonitors.push_back(pit->monitor.get());
@@ -1222,7 +1339,7 @@ Error BackingMemory::updateRange(ManageRequest type, size_t offset, size_t lengt
 						pit->transactionState = ManagedSpace::TxState::none;
 					} else {
 						globalReclaimer->addPage(&pit->cachePage);
-						pit->transactionState = ManagedSpace::TxState::inReclaim;
+						pit->transactionState = ManagedSpace::TxState::inReclaimer;
 					}
 					ref_rc(pit->monitor.get());
 					pendingMonitors.push_back(pit->monitor.get());
@@ -1334,23 +1451,22 @@ coroutine<frg::expected<Error>> BackingMemory::invalidateRange(uintptr_t offset,
 			}
 
 			if(pit->loadState == ManagedSpace::LoadState::present) {
-				if(pit->monitor) {
+				if(pit->transactionState == ManagedSpace::TxState::performReclaim
+						|| pit->transactionState == ManagedSpace::TxState::avertReclaim) {
+					pit->forceInvalidation = true;
+					if(!pit->monitor)
+						pit->monitor = frg::allocate_intrusive_shared<ManagedSpace::TransactionMonitor>(Allocator{});
+					monitor = pit->monitor;
+				} else if(pit->monitor) {
 					monitor = pit->monitor;
 				} else if(!pit->lockCount) {
-					if(pit->transactionState == ManagedSpace::TxState::inReclaim)
+					if(pit->transactionState == ManagedSpace::TxState::inReclaimer)
 						globalReclaimer->removePage(&pit->cachePage);
-					pit->transactionState = ManagedSpace::TxState::none;
-					pit->loadState = ManagedSpace::LoadState::evicting;
+					pit->transactionState = ManagedSpace::TxState::performReclaim;
 					shouldEvict = true;
 				} else {
 					co_return Error::illegalArgs;
 				}
-			} else {
-				assert(pit->loadState == ManagedSpace::LoadState::evicting);
-				pit->forceInvalidation = true;
-				if(!pit->monitor)
-					pit->monitor = frg::allocate_intrusive_shared<ManagedSpace::TransactionMonitor>(Allocator{});
-				monitor = pit->monitor;
 			}
 		}
 
@@ -1361,9 +1477,10 @@ coroutine<frg::expected<Error>> BackingMemory::invalidateRange(uintptr_t offset,
 				auto irqLock = frg::guard(&irqMutex());
 				auto lock = frg::guard(&_managed->mutex);
 
-				if(pit->loadState == ManagedSpace::LoadState::evicting) {
+				if(pit->transactionState == ManagedSpace::TxState::performReclaim) {
 					physical = pit->physical;
 					pit->loadState = ManagedSpace::LoadState::missing;
+					pit->transactionState = ManagedSpace::TxState::none;
 					pit->physical = PhysicalAddr(-1);
 				} else {
 					physical = PhysicalAddr(-1);
@@ -1411,16 +1528,12 @@ PhysicalRange FrontalMemory::peekRange(uintptr_t offset, FetchFlags) {
 	if(!pit)
 		return PhysicalRange{.physical = PhysicalAddr(-1), .size = 0, .cachingMode = CachingMode::null};
 
-	if(pit->loadState == ManagedSpace::LoadState::present
-			|| pit->loadState == ManagedSpace::LoadState::evicting) {
+	if(pit->loadState == ManagedSpace::LoadState::present) {
 		auto physical = pit->physical;
 		assert(physical != PhysicalAddr(-1));
 
-		if(pit->loadState == ManagedSpace::LoadState::evicting) {
-			// Cancel evication -- the page is still needed.
-			pit->loadState = ManagedSpace::LoadState::present;
-			pit->transactionState = ManagedSpace::TxState::inReclaim;
-			globalReclaimer->addPage(&pit->cachePage);
+		if(pit->transactionState == ManagedSpace::TxState::performReclaim) {
+			pit->transactionState = ManagedSpace::TxState::avertReclaim;
 		}
 
 		return PhysicalRange{.physical = physical, .size = kPageSize, .cachingMode = CachingMode::null, .isMutable = true};
@@ -1448,17 +1561,13 @@ FrontalMemory::touchRange(uintptr_t offset, size_t, FetchFlags flags) {
 		// Try the fast-paths first.
 		auto [pit, wasInserted] = _managed->pages.find_or_insert(index, _managed.get(), index);
 		assert(pit);
-		if(pit->loadState == ManagedSpace::LoadState::present
-				|| pit->loadState == ManagedSpace::LoadState::evicting) {
+		if(pit->loadState == ManagedSpace::LoadState::present) {
 			assert(pit->physical != PhysicalAddr(-1));
 
-			if(pit->transactionState == ManagedSpace::TxState::inReclaim) {
+			if(pit->transactionState == ManagedSpace::TxState::inReclaimer) {
 				globalReclaimer->bumpPage(&pit->cachePage);
-			}else if(pit->loadState == ManagedSpace::LoadState::evicting) {
-				// Cancel evication -- the page is still needed.
-				pit->loadState = ManagedSpace::LoadState::present;
-				pit->transactionState = ManagedSpace::TxState::inReclaim;
-				globalReclaimer->addPage(&pit->cachePage);
+			}else if(pit->transactionState == ManagedSpace::TxState::performReclaim) {
+				pit->transactionState = ManagedSpace::TxState::avertReclaim;
 			}
 
 			co_return kPageSize - misalign;

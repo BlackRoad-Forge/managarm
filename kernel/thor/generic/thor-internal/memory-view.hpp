@@ -7,6 +7,7 @@
 #include <async/oneshot-event.hpp>
 #include <async/post-ack.hpp>
 #include <async/recurring-event.hpp>
+#include <frg/list.hpp>
 #include <frg/rcu_radixtree.hpp>
 #include <frg/shared_ptr.hpp>
 #include <frg/vector.hpp>
@@ -53,12 +54,25 @@ struct CachePage {
 	frg::default_list_hook<CachePage> listHook;
 
 	uint32_t flags = 0;
+	uint8_t generation = 0;
 	std::atomic<unsigned int> useCount = 0;
 };
+
+using CachePagesList = frg::intrusive_list<
+	CachePage,
+	frg::locate_member<
+		CachePage,
+		frg::default_list_hook<CachePage>,
+		&CachePage::listHook
+	>
+>;
 
 // This is the "backend" part of a memory object.
 struct CacheBundle {
 	friend struct MemoryReclaimer;
+
+	// Number of generations for the LRU mechanism.
+	static constexpr unsigned int numGenerations = 8;
 
 	virtual void incrementUses(CachePage *page) = 0;
 	virtual void decrementUses(CachePage *page) = 0;
@@ -66,6 +80,24 @@ struct CacheBundle {
 	virtual void markDirty(CachePage *page) = 0;
 
 private:
+	frg::ticket_spinlock reclaimMutex_;
+
+	// One list of pages per generation.
+	// Protected by reclaimMutex_.
+	frg::intrusive_list<
+		CachePage,
+		frg::locate_member<
+			CachePage,
+			frg::default_list_hook<CachePage>,
+			&CachePage::listHook
+		>
+	> genLists_[numGenerations];
+
+	// Points to the newest generation.
+	// This is cyclically incremented on rotation.
+	unsigned int newestGen_ = 0;
+
+	// Protected by reclaimMutex_.
 	frg::intrusive_list<
 		CachePage,
 		frg::locate_member<
@@ -76,6 +108,9 @@ private:
 	> _reclaimList;
 
 	async::recurring_event _reclaimEvent;
+
+	// List hook used by MemoryReclaimer.
+	frg::intrusive_rcu_list_hook<CacheBundle> reclaimerHook_;
 };
 
 inline void markDirty(PfnDescriptor descriptor) {
@@ -562,14 +597,11 @@ struct ManagedSpace : CacheBundle {
 		missing,
 		// Page contents are valid and page is returned from peekRange().
 		present,
-		// Page contents are valid but page is not returned from peekRange().
-		evicting,
 	};
 
 	enum class TxState : uint8_t {
 		// Page is not in a queue.
 		// Valid in LoadState::missing. Valid in LoadState::present with lockCount > 0.
-		// Valid in LoadState::evicting.
 		none,
 		// Page is in _initializationList.
 		// Valid in LoadState::missing.
@@ -588,8 +620,17 @@ struct ManagedSpace : CacheBundle {
 		// Valid in LoadState::present.
 		writeback,
 		// Page is in the memory reclaimer's LRU queue.
+		// Page is owned by the MemoryReclaimer.
 		// Valid in LoadState::present with lockCount == 0 and useCount == 0.
-		inReclaim,
+		inReclaimer,
+		// Page has been selected for reclaimation and is awaiting fenceEphemeral().
+		// Page is owned by the ManagedSpace reclamation logic.
+		// Valid in LoadState::present.
+		performReclaim,
+		// Page will not be reclaimed but is still awaiting fenceEphemeral().
+		// Page is owned by the ManagedSpace reclamation logic.
+		// Valid in LoadState::present.
+		avertReclaim,
 	};
 
 	// Struct that is attached to ManagedPage for the duration of
@@ -600,8 +641,8 @@ struct ManagedSpace : CacheBundle {
 	// For writeback:
 	// * Attached when entering TxState::wantWriteback.
 	// * Completed when leaving TxState::writeback.
-	// For forced eviction (invalidateRange() on a page already in LoadState::evicting):
-	// * Attached by invalidateRange() while the page is in LoadState::evicting.
+	// For forced eviction (invalidateRange() on a page already in TxState::performReclaim):
+	// * Attached by invalidateRange() while the page is in TxState::performReclaim.
 	// * Completed by the eviction coroutine after transitioning to LoadState::missing.
 	struct TransactionMonitor final : frg::intrusive_rc {
 		async::oneshot_primitive event;
@@ -623,9 +664,9 @@ struct ManagedSpace : CacheBundle {
 		TxState transactionState{TxState::none};
 		// Whether the page is dirty even after a pending writeback completes.
 		// Can only be true in LoadState::present and TxState::writeback.
-		// If set in LoadState::evicting, causes transition to LoadState::present.
+		// If set in TxState::performReclaim or TxState::avertReclaim, causes transition to dirty.
 		bool stillDirty{false};
-		// Set by invalidateRange() when the page is already in LoadState::evicting,
+		// Set by invalidateRange() when the page is already in TxState::performReclaim,
 		// to request that the eviction coroutine raise monitor after completing
 		// the transition to LoadState::missing.
 		bool forceInvalidation{false};
